@@ -1,10 +1,12 @@
 # lcsc-scrape
 
-A tool to scrape part info from LCSC  for parts available from the JLCPCB SMT assembly service into a local database for easier part lookup. In theory you could use it to gather a data about LCSC parts not in the JLCPCB SMT assembly service but that's not it's intended purpose.
+A tool to scrape part info from LCSC  for parts available from the JLCPCB SMT assembly service into a local database for easier part lookup. You could use it to gather data about LCSC parts not in the JLCPCB SMT assembly service but that's not it's intended purpose.
 
 ## Using
 
 If all you want to do is query the database you can just download the `..._executable_and_db.tar.gz` from releases. You can optionally download the `...cache.tar.gz` release to get the cache dir if you want to update the db. 
+
+[Latest Release](https://github.com/cs2dsb/lcsc-scrape.rs/releases)
 
 Currently releases are only built for linux-amd64 but if there's any demand for it I can build for more platforms - raise an issue. In the mean time you can build from source quite easily with cargo & rust.
 
