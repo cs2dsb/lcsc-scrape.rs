@@ -88,6 +88,12 @@ Columns beginning with pp_ are the post processed ones and are BOOL or REAL
 
 If there are slow queries you are running regularly you can use query to add indexes. I've not found it necessary as the whole DB fits in memory and all queries complete in < 1 second for me so far.
 
+### Windows / quote shenanigans
+
+I don't often use windows but it appears that cmd.exe doesn't support single quotes. SQL does though so you can just swap the quote order around "blah blah where x = 'blah'". You can also escape the inner ones with `\` "where x = \"blah\"".
+
+Backslash to break commands on to multiple lines doesn't appear to work in cmd either.
+
 ### Useful queries
 
 Get a list of LCSC categories to filter by
@@ -118,7 +124,7 @@ WHERE Category = "Power Management ICs/DC-DC Converters"
 Get the descriptions and datasheet links for a part when the key value pairs aren't useful
 ```
 ./lcsc-scrape query \
-"SELECT part_number, Description, JLC_Description, Datasheet, JLC_Datasheet"
+'SELECT part_number, Description, JLC_Description, Datasheet, JLC_Datasheet
 FROM parts 
 WHERE part_number = "C14867"'
 ```
