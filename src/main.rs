@@ -2,16 +2,19 @@ use std::{
     fs,
     io::{
         Error as IoError,
+        ErrorKind as IoErrorKind,
         Write,
         Read,
+        stdout,
     },
     env,
     path::{ Path },
-    collections::{
-        HashMap,
-        //HashSet,
+    collections::HashMap,
+    time::{
+        Instant,
+        Duration,
     },
-    time::Instant,
+    thread::sleep,
 };
 
 // LinkedHashSet preserves insertion order
@@ -23,9 +26,19 @@ use log::*;
 use lazy_static::lazy_static;
 use reqwest::{
     Error as ReqwestError,
+    Url,
+    Method,
+    blocking::{
+        Request,
+    },
+    header::{
+        ACCEPT,
+        CONTENT_TYPE,
+        HeaderValue,
+    },
 };
 use clap::{
-    crate_version, 
+    crate_version,
     crate_name,
     App,
     AppSettings,
@@ -34,7 +47,7 @@ use clap::{
     ArgGroup,
 };
 use regex::{
-    Regex, 
+    Regex,
     Error as RegexError,
 };
 use scraper::{
@@ -57,7 +70,7 @@ use rusqlite::{
 };
 
 use calamine::{
-    Reader, 
+    Reader,
     open_workbook_auto,
     Error as SheetError,
     DataType,
@@ -65,9 +78,12 @@ use calamine::{
 
 lazy_static! {
     static ref REGEX_PN: Regex = Regex::new(r"^[cC]\d+(_b)*$").unwrap();
-    static ref REGEX_VOLTAGE: Regex = Regex::new(r"^(-{0,1}\d+(\.\d+)*)(V|Vin|mV)").unwrap();
+    static ref REGEX_VOLTAGE: Regex = Regex::new(r"^(-{0,1}\d+(?:\.\d+)*)(kV|KV|V|Vin|mV)").unwrap();
+    static ref REGEX_CURRENT: Regex = Regex::new(r"^(-{0,1}\d+(?:\.\d+)*)(kA|KA|A|mA|uA)").unwrap();
     static ref REGEX_PRICE: Regex = Regex::new(r"^(?:US\$){0,1}(\d+(\.\d+){0,1})$").unwrap();
-    static ref REGEX_RESISTANCE: Regex = Regex::new(r"^(\d+(\.\d+){0,1})[KMmun]*$").unwrap();
+    static ref REGEX_RESISTANCE: Regex = Regex::new(r"^(\d+(?:\.\d+){0,1})([kKMmunp]{0,1})$").unwrap();
+    static ref REGEX_INDUCTANCE: Regex = Regex::new(r"^(\d+(?:\.\d+){0,1})([kKMmunp]{0,1})H$").unwrap();
+    static ref REGEX_CAPACITANCE: Regex = Regex::new(r"^(\d+(?:\.\d+){0,1})([kKMmunp]{0,1})F$").unwrap();
 
     static ref SELECTOR_INFO_TABLE: Selector = Selector::parse("table.info-table").unwrap();
     static ref SELECTOR_SPEC_TABLE: Selector = Selector::parse("table.products-specifications").unwrap();
@@ -80,13 +96,25 @@ lazy_static! {
     static ref SELECTOR_LINK: Selector = Selector::parse("a").unwrap();
 }
 
-const RESISTANCE_SUFFIX: [(&'static str, f64); 5] = [
+const SI_SUFFIX: [(&'static str, f64); 11] = [
     ("K", 1.0E3),
+    ("k", 1.0E3),
+    ("kV", 1.0E3),
+    ("kA", 1.0E3),
+    ("KV", 1.0E3),
+    ("KA", 1.0E3),
     ("M", 1.0E6),
     ("m", 1.0E-3),
     ("u", 1.0E-6),
     ("n", 1.0E-9),
+    ("p", 1.0E-12),
 ];
+
+const LOG_DURATION: Duration = Duration::from_secs(10);
+// If the limit is accidentlly exceeded, how many times to multiply the usual sleep by to compensate
+const RATE_LIMIT_EXCEEDED_MULTIPLIER: u32 = 10;
+const LCSC_RATE_LIMIT: Duration = Duration::from_secs(1);
+const JLC_RATE_LIMIT: Duration = Duration::from_millis(300);
 
 #[derive(Debug)]
 enum MainErrors {
@@ -99,6 +127,15 @@ enum MainErrors {
     DbError(DbError),
     SheetError(SheetError),
     ResponseError(String),
+}
+
+impl MainErrors {
+    fn is_broken_pipe(&self) -> bool {
+        match self {
+            MainErrors::IoError(io) => io.kind() == IoErrorKind::BrokenPipe,
+            _ => false,
+        }
+    }
 }
 
 impl From<IoError> for MainErrors {
@@ -138,24 +175,24 @@ impl From<SheetError> for MainErrors {
 }
 
 
-#[derive(Debug, Deserialize, Serialize)] 
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SearchResponse {
     success: bool,
     message: String,
     result: SearchResult,
 }
 
-#[derive(Debug, Deserialize, Serialize)] 
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SearchResultLink {
     lcsc_part_number: bool,
     links: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)] 
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum SearchResult {
     Link(SearchResultLink),
-    // If there is no exact match it returns an empty array for 
+    // If there is no exact match it returns an empty array for
     // whatever reason
     Array(Vec<String>),
 }
@@ -177,7 +214,7 @@ impl SearchResult {
 }
 
 
-#[derive(Debug, Deserialize, Serialize)] 
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JlcComponentLibraryType {
     Expand,
@@ -200,7 +237,7 @@ impl JlcComponentLibraryType {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)] 
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct JlcComponentPrice {
     product_price: f64,
@@ -209,7 +246,7 @@ pub struct JlcComponentPrice {
     end_number: isize,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)] 
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct JlcSmtCompListItem {
     stock_count: isize,
@@ -219,15 +256,26 @@ pub struct JlcSmtCompListItem {
     component_prices: Vec<JlcComponentPrice>,
     describe: Option<String>,
     data_manual_url: Option<String>,
+
+    lcsc_goods_url: String,
+
+    component_brand_en: Option<String>,
+    component_image_url: Option<String>,
+    min_image: Option<String>,
+    component_specification_en: Option<String>,
+    component_type_en: Option<String>,
+    component_model_en: Option<String>,
+    erp_component_name: Option<String>,
+    component_source: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)] 
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct JlcSmtCompListData {
     total: isize,
-    list: Vec<JlcSmtCompListItem>,      
+    list: Vec<JlcSmtCompListItem>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)] 
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct JlcSmtCompListResult {
     code: isize,
     data: JlcSmtCompListData,
@@ -238,7 +286,7 @@ impl JlcSmtCompListResult {
     fn merge(&mut self, other: Self) {
         let JlcSmtCompListResult { code, data, message } = other;
         let JlcSmtCompListData { total, list } = data;
-        
+
         self.code = code;
         self.data.list.extend(list);
         self.data.total = self.data.total.max(total);
@@ -267,7 +315,7 @@ fn create_db(con: &mut Connection) -> Result<(), DbError> {
 
     con.execute(r"
         create table if not exists keys (
-            key text primary key 
+            key text primary key
         )",
         NO_PARAMS,
     )?;
@@ -390,7 +438,7 @@ fn extract_table_kvp(part_number: &str, html: &Html, selector: &Selector) -> Vec
 
     for table in html.select(selector) {
         for (row_i, row) in table.select(&SELECTOR_TABLE_BODY_ROW).enumerate() {
-            
+
             match extract_row_kvp(row.select(&SELECTOR_TD)) {
                 Ok(Some(pair)) => results.push(pair),
                 Ok(None) => {},
@@ -402,36 +450,100 @@ fn extract_table_kvp(part_number: &str, html: &Html, selector: &Selector) -> Vec
     results
 }
 
-fn download_part(part_number: &str) -> Result<String, MainErrors> {
+enum LcscPartSpec<'a> {
+    Url(&'a str, &'a str),
+    CNumber(&'a str),
+}
+
+fn rate_limited_request(rate: Duration, req: Request) -> Result<reqwest::blocking::Response, reqwest::Error> {
     let client = reqwest::blocking::Client::new();
 
-    let url = format!("https://lcsc.com/api/global/additional/search?q={}", part_number);
+    let fetch = || {
+        let start = Instant::now();
+
+        let res = client.execute(req.try_clone().unwrap());
+
+        let elapsed = start.elapsed();
+        if elapsed < rate {
+            let remaining = rate - elapsed;
+            debug!("Extra sleep: {:?} ({})", remaining, req.url());
+            sleep(remaining);
+        }
+
+        res
+    };
+
+    let mut res = fetch()?;
+    while res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        warn!("Hit rate limiting ({})", req.url());
+        sleep(rate * RATE_LIMIT_EXCEEDED_MULTIPLIER);
+        res = fetch()?;
+    }
+
+    let headers = res.headers();
+    if headers.contains_key("x-ratelimit-remaining") {
+        let remaining = match headers["x-ratelimit-remaining"].to_str() {
+            Ok(s) => match s.parse::<i32>() {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to parse x-ratelimit-remaining header ({}) as i32: {:?}", s, e);
+                    60
+                },
+            },
+            Err(e) => {
+                warn!("Failed to extract x-ratelimit-remaining header as str: {:?}", e);
+                60
+            }
+        };
+
+        if remaining < 10 {
+            warn!("Exceeding rate limit (remaining {} on {})", remaining, req.url());
+            sleep(rate * RATE_LIMIT_EXCEEDED_MULTIPLIER);
+        }
+    }
+
+    Ok(res)
+}
+
+fn download_lcsc_part(part_spec: LcscPartSpec) -> Result<String, MainErrors> {
+    let (url, part_number) = match part_spec {
+        LcscPartSpec::Url(url, c) => (url.to_string(), c.to_string()),
+        LcscPartSpec::CNumber(c) => {
+            let res = rate_limited_request(
+                LCSC_RATE_LIMIT,
+                Request::new(Method::GET, Url::parse(&format!("https://lcsc.com/api/global/additional/search?q={}", c)).unwrap())
+            )?;
+
+            let st = res.status();
+            if !st.is_success() {
+                Err(MainErrors::ResponseError(format!("Failed to find product link (HTTP code {:?})",  st)))?;
+            }
+
+            let text = res.text()?;
+
+            let res = serde_json::from_str(&text);
+            if res.is_err() {
+                error!("Error parsing: {}", text);
+            }
+            let res: SearchResponse = res?;
+            if !res.success || !res.result.is_link() {
+                debug!("Non sucess/link response data: {:#?}", res);
+                Err(MainErrors::ResponseError(format!("Failed to find product link (success {}, is_link {}) - usually means the produc detail page has been deleted or never existed", res.success, res.result.is_link())))?;
+            }
+
+            let link = format!("https://lcsc.com{}", res.result.get_link().links);
+            debug!("{}: Product link = {}", c, link);
+
+            (link, c.to_string())
+        },
+    };
+
     debug!("{}: Fetching LCSC page ({})", part_number, url);
 
-    let res = client
-        .get(&url)
-        .send()?;
-
-    let st = res.status();
-    if !st.is_success() {
-        Err(MainErrors::ResponseError(format!("Failed to find product link (HTTP code {:?})",  st)))?;
-    }
-
-    let text = res.text()?;
-
-    let res: SearchResponse = serde_json::from_str(&text)?;
-    if !res.success || !res.result.is_link() {
-        debug!("Non sucess/link response data: {:#?}", res);
-        Err(MainErrors::ResponseError(format!("Failed to find product link (success {}, is_link {}) - usually means the produc detail page has been deleted or never existed", res.success, res.result.is_link())))?;
-    }
-
-    let link = format!("https://lcsc.com{}", res.result.get_link().links);
-    debug!("{}: Product link = {}", part_number, link);
-
-    let res = client
-        .get(&link)
-        .send()?;
-
+    let res = rate_limited_request(
+        LCSC_RATE_LIMIT,
+        Request::new(Method::GET, Url::parse(&url).unwrap())
+    )?;
     let st = res.status();
     if !st.is_success() {
         Err(MainErrors::ResponseError(format!("Failed to get product page (HTTP code {:?})",  st)))?;
@@ -443,8 +555,6 @@ fn download_part(part_number: &str) -> Result<String, MainErrors> {
 }
 
 fn download_jlc_info(part_number: &str) -> Result<String, MainErrors> {
-    let client = reqwest::blocking::Client::new();
-
     let url = "https://jlcpcb.com/shoppingCart/smtGood/selectSmtComponentList";
 
     let mut data = HashMap::new();
@@ -456,34 +566,54 @@ fn download_jlc_info(part_number: &str) -> Result<String, MainErrors> {
     let mut merged_result = JlcSmtCompListResult::default();
     let mut more = true;
 
-    while more {
+    // There seems to be a bug in their API that sometimes returns "total" that's > than the real
+    // number which causes the code to just keep requesting infinite pages and getting no more results
+    let mut empty_count = 0;
+    while more && empty_count < 5 {
         debug!("{}: Fetching JLC info page {} ({})", part_number, current_page, url);
 
         data.insert("currentPage", format!("{}", current_page));
 
-        let res = client.post(url)
-            .header("Accept", "application/json")
-            .form(&data)
-            .send()?;
+        let mut req = Request::new(Method::POST, Url::parse(url).unwrap());
+
+        req.headers_mut().insert(ACCEPT, HeaderValue::from_static("application/json"));
+        req.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let body = serde_json::to_string(&data).unwrap();
+        *req.body_mut() = Some(body.into());
+
+        let res = rate_limited_request(
+            JLC_RATE_LIMIT,
+            req,
+        )?;
 
         let st = res.status();
+        let text = res.text()?;
         if !st.is_success() {
-            Err(MainErrors::ResponseError(format!("Failed to get JLC data (HTTP code {:?})",  st)))?;
+            Err(MainErrors::ResponseError(format!("Failed to get JLC data (HTTP code {:?}. Body: {})",  st, text)))?;
         }
 
-        let text = res.text()?;
+        trace!("Response: {:#?}", text);
 
-        let res = serde_json::from_str::<JlcSmtCompListResult>(&text)?;
+        let res = serde_json::from_str::<JlcSmtCompListResult>(&text);
+        if res.is_err() {
+            error!("Failed deserializing: {}", text);
+        }
+        let res = res?;
         if res.code != 200 {
             debug!("Non 200 response data: {:#?}", res);
             Err(MainErrors::ResponseError(format!("Failed to get JLC data (code {})", res.code)))?;
         }
 
+        if res.data.list.len() == 0 {
+            empty_count += 1;
+        }
         merged_result.merge(res);
 
         more = merged_result.data.list.len() < (merged_result.data.total as usize);
         current_page += 1;
     }
+
 
     Ok(serde_json::to_string(&merged_result)?)
 }
@@ -515,7 +645,7 @@ fn save_pairs(con: &Connection, columns: &mut Vec<String>, part_number: &str, pa
     };
 
     let mut statement = String::new();
-    if exists { 
+    if exists {
         statement.push_str("UPDATE parts SET ");
         for (i, (key, value)) in pairs.iter().enumerate() {
             if i != 0 {
@@ -524,7 +654,7 @@ fn save_pairs(con: &Connection, columns: &mut Vec<String>, part_number: &str, pa
             // Remove any quotes in the string
             let value = value.replace("\"", "");
             statement.push_str(&format!("\"{}\"=\"{}\" ", key, value));
-        }        
+        }
         statement.push_str(&format!(" WHERE part_number = \"{}\"", part_number));
     } else {
         statement.push_str("INSERT INTO parts (part_number");
@@ -535,9 +665,9 @@ fn save_pairs(con: &Connection, columns: &mut Vec<String>, part_number: &str, pa
         for (_, value) in pairs {
             // Remove any quotes in the string
             let value = value.replace("\"", "");
-            
+
             statement.push_str(&format!(", \"{}\"", value));
-        }        
+        }
         statement.push_str(")");
     }
 
@@ -547,11 +677,11 @@ fn save_pairs(con: &Connection, columns: &mut Vec<String>, part_number: &str, pa
 }
 
 fn fetch(
-    con: &mut Connection, 
-    cache_path: &Path, 
-    part_numbers: Vec<String>, 
-    jlc_data: bool, 
-    refresh_cache_jlc: bool, 
+    con: &mut Connection,
+    cache_path: &Path,
+    part_numbers: Vec<String>,
+    jlc_data: bool,
+    refresh_cache_jlc: bool,
     refresh_cache_lcsc: bool,
     download_to_cache_only: bool,
     purge_cached_errors: bool,
@@ -559,8 +689,8 @@ fn fetch(
     // Do the validation first so it doesn't explode half way through after fetching a bunch
     for part in part_numbers.iter() {
         if !REGEX_PN.is_match(part) {
-            Err(MainErrors::ValidationError(format!("Part number {} doesn't match expected pattern {}", 
-                part, REGEX_PN.to_string())))?; 
+            Err(MainErrors::ValidationError(format!("Part number {} doesn't match expected pattern {}",
+                part, REGEX_PN.to_string())))?;
         }
     }
 
@@ -575,6 +705,9 @@ fn fetch(
     let mut cached = 0;
     let mut purged = 0;
 
+
+    let mut last_print = Instant::now();
+
     for (i, mut part) in part_numbers.into_iter().enumerate() {
         let mut basic = false;
         if part.ends_with("_b") {
@@ -582,8 +715,9 @@ fn fetch(
             part.truncate(part.len() - 2);
         }
 
-        if i % ten_pc == 0 {
-            info!("Total {:8}, Processed: {:8} ({:3}%), Downloaded: {:8}, Cached: {:8}, Purged: {:8}", 
+        if last_print.elapsed() > LOG_DURATION {
+            last_print = Instant::now();
+            info!("Total {:8}, Processed: {:8} ({:3}%), Downloaded: {:8}, Cached: {:8}, Purged: {:8}",
                 num_parts,
                 i,
                 (i / ten_pc) * 10,
@@ -608,11 +742,12 @@ fn fetch(
                         downloaded += 1;
                     },
                     Err(e) => error!("{}: Error fetching JLC part info: {:?}", part, e),
-                };                
+                };
             } else {
-                debug!("{}: Cached (JLC)", part); 
+                debug!("{}: Cached (JLC)", part);
                 cached += 1;
             }
+
 
             if !download_to_cache_only && path.exists() {
                 let info = {
@@ -621,6 +756,7 @@ fn fetch(
                     file.read_to_string(&mut contents)?;
                     serde_json::from_str::<JlcSmtCompListResult>(&contents)
                 };
+
 
                 let mut purge = purge_cached_errors;
 
@@ -635,6 +771,8 @@ fn fetch(
                                 .filter(|x| x.component_code == part)
                                 .nth(0)
                             {
+                                pairs.push(("LCSC_URL".to_string(), item.lcsc_goods_url.clone()));
+
                                 basic = item.component_library_type.is_basic();
                                 let stock = item.stock_count;
 
@@ -672,8 +810,12 @@ fn fetch(
 
 
         let path = cache_path.join(&part);
-        if refresh_cache_lcsc || !path.exists() || fs::metadata(path.clone())?.len() == 0 {
-            let text = match download_part(&part) {
+        if !download_to_cache_only && (refresh_cache_lcsc || !path.exists() || fs::metadata(path.clone())?.len() == 0) {
+            let part_spec = match pairs.iter().find(|&(key, _)| key == "LCSC_URL") {
+                Some((_, value)) => LcscPartSpec::Url(value, &part),
+                None =>  LcscPartSpec::CNumber(&part),
+            };
+            let text = match download_lcsc_part(part_spec) {
                 Ok(text) => text,
                 Err(e) => {
                     error!("{}: Error fetching LCSC part: {:?}", part, e);
@@ -684,7 +826,7 @@ fn fetch(
             file.write_all(text.as_bytes())?;
             downloaded += 1;
         } else {
-            debug!("{}: Cached (LCSC)", part); 
+            debug!("{}: Cached (LCSC)", part);
             cached += 1;
         }
 
@@ -727,7 +869,7 @@ fn fetch(
         save_pairs(&tx, &mut columns, &part, pairs)?;
     }
 
-    info!("Total {:8}, Processed: {:8} ({:3}%), Downloaded: {:8}, Cached: {:8}, Purged: {:8}", 
+    info!("Total {:8}, Processed: {:8} ({:3}%), Downloaded: {:8}, Cached: {:8}, Purged: {:8}",
         num_parts,
         num_parts,
         100,
@@ -752,9 +894,9 @@ fn get_and_log_err(row: &Row, n: usize, stmt: &str) -> Result<Option<String>, Db
     }
 }
 
-fn run_post_process<F, T>(con: &Connection, columns: &mut Vec<String>, column: &str, f: F) -> Result<(), MainErrors> 
-where 
-    // Result string is NOT quoted when creating the update statement to allow numbers/etc. 
+fn run_post_process<F, T>(con: &Connection, columns: &mut Vec<String>, column: &str, f: F) -> Result<(), MainErrors>
+where
+    // Result string is NOT quoted when creating the update statement to allow numbers/etc.
     // if result is actually a string, quotes need to be included in the result
     F: Fn(Option<String>, &str) -> Option<String>,
     T: ToDbType,
@@ -762,7 +904,7 @@ where
     info!("Post processed \"{}\" column ", column);
 
     let pp_column = format!("pp_{}", column);
-    
+
     add_column_type::<T>(con, columns, pp_column.clone())?;
 
     let stmt = &format!("SELECT part_number, \"{}\" FROM parts", column);
@@ -807,30 +949,46 @@ where
 
 
 // Checks the value against the regex then parses capture group 1 as a f64
-fn parse_float(value: &str, regex: &Regex, column: &str, part_number: &str) -> Option<f64> {
+fn parse_float(value: &str, regex: &Regex, column: &str, part_number: &str, si_unit: bool) -> Option<f64> {
     if let Some(caps) = regex.captures(value) {
         if let Some(f_match) = caps.get(1) {
+            let mul = {
+                let mut mul = 1.;
+
+                if si_unit {
+                    if let Some(unit_match) = caps.get(2) {
+                        for (suffix, m) in SI_SUFFIX.iter() {
+                            if unit_match.as_str().starts_with(*suffix) {
+                                mul = *m;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                mul
+            };
             return match f_match.as_str().parse::<f64>() {
-                Ok(p) => Some(p),
+                Ok(p) => Some(p * mul),
                 Err(e) => {
-                    warn!("{}: Found value \"{}\" in column \"{}\" but failed to parse it as a float: {:?}", 
+                    warn!("{}: Found value \"{}\" in column \"{}\" but failed to parse it as a float: {:?}",
                         part_number, f_match.as_str(), column, e);
                     None
                 }
             };
-        } 
-    } 
+        }
+    }
 
-    warn!("{}: Found value \"{}\" in column \"{}\" but failed to parse match against regex \"{}\"", 
+    warn!("{}: Found value \"{}\" in column \"{}\" but failed to parse match against regex \"{}\"",
         part_number, value, column, regex.as_str());
     None
 }
 
-// Calls parse_float then converts the result back to a string ready to be inserted 
+// Calls parse_float then converts the result back to a string ready to be inserted
 // in the db. Could probably just stuff the regex capture in the field but I'd rather
 // it fail to parse here and raise a warning than SQL queries silently not matching later
-fn parse_float_to_db_str(value: &str, regex: &Regex, column: &str, part_number: &str) -> Option<String> {
-    parse_float(value, regex, column, part_number)
+fn parse_float_to_db_str(value: &str, regex: &Regex, column: &str, part_number: &str, si_unit: bool) -> Option<String> {
+    parse_float(value, regex, column, part_number, si_unit)
         .map(|x| format!("{}", x))
 }
 
@@ -840,7 +998,7 @@ fn post_process(con: &mut Connection) -> Result<(), MainErrors> {
     let mut columns = Vec::new();
     populate_columns(&tx, &mut columns)?;
 
-    
+
     let filtered_columns: Vec<String> = columns
         .iter()
         .filter_map(|x| if x.starts_with("pp_") {
@@ -866,19 +1024,24 @@ fn post_process(con: &mut Connection) -> Result<(), MainErrors> {
     run_post_process::<_, f64>(&tx, &mut columns, "Resistance (Ohms)", |value, part_number| {
         if value.is_none() { return None; }
         let value = value.unwrap();
-        
-        parse_float(&value, &REGEX_RESISTANCE, "Resistance (Ohms)", part_number).map(|x| {
-            let mut mul = 1.;
-            for (suffix, m) in RESISTANCE_SUFFIX.iter() {
-                if value.ends_with(suffix) {
-                    mul = *m;
-                    break;
-                }
-            }
-            format!("{}", x * mul)
-        })
+
+        parse_float_to_db_str(&value, &REGEX_RESISTANCE, "Resistance (Ohms)", part_number, true)
     })?;
-    
+
+    run_post_process::<_, f64>(&tx, &mut columns, "Inductance", |value, part_number| {
+        if value.is_none() { return None; }
+        let value = value.unwrap();
+
+        parse_float_to_db_str(&value, &REGEX_INDUCTANCE, "Inductance", part_number, true)
+    })?;
+
+    run_post_process::<_, f64>(&tx, &mut columns, "Capacitance", |value, part_number| {
+        if value.is_none() { return None; }
+        let value = value.unwrap();
+
+        parse_float_to_db_str(&value, &REGEX_CAPACITANCE, "Capacitance", part_number, true)
+    })?;
+
     //These loops are separate so that errors for a given post-process are grouped together rather than
     //mixed in the order that the columns are in the DB
     for col in filtered_columns.iter() {
@@ -887,7 +1050,7 @@ fn post_process(con: &mut Connection) -> Result<(), MainErrors> {
                 if value.is_none() { return None; }
                 let value = value.unwrap();
 
-                parse_float_to_db_str(&value, &REGEX_PRICE, col, part_number)
+                parse_float_to_db_str(&value, &REGEX_PRICE, col, part_number, false)
             })?;
         }
     }
@@ -898,13 +1061,24 @@ fn post_process(con: &mut Connection) -> Result<(), MainErrors> {
                 if value.is_none() { return None; }
                 let value = value.unwrap();
 
-                parse_float_to_db_str(&value, &REGEX_VOLTAGE, col, part_number)
+                parse_float_to_db_str(&value, &REGEX_VOLTAGE, col, part_number, true)
+            })?;
+        }
+    }
+
+    for col in filtered_columns.iter() {
+        if col.contains("Current") {
+            run_post_process::<_, f64>(&tx, &mut columns, col, |value, part_number| {
+                if value.is_none() { return None; }
+                let value = value.unwrap();
+
+                parse_float_to_db_str(&value, &REGEX_CURRENT, col, part_number, true)
             })?;
         }
     }
 
     tx.commit()?;
-    
+
 
     Ok(())
 }
@@ -925,20 +1099,45 @@ fn clear_cache(cache_path: &Path) -> Result<(), MainErrors> {
     Ok(())
 }
 
-fn csv<'a, I>(i: I)
-where 
+fn csv<'a, I>(i: I) -> Result<(), MainErrors>
+where
     I: Iterator<Item=&'a String>
 {
+    let mut stdout = stdout();
     for (i, v) in i.enumerate() {
         if i > 0 {
-            print!(", ");
-        } 
-        print!("{}", v);
+            write!(stdout, ", ")?;
+        }
+        write!(stdout, "{}", v)?;
     }
-    println!("");
+    writeln!(stdout, "")?;
+
+    Ok(())
 }
 
-fn query(con: &mut Connection, query: &str, drop_null_columns: bool) -> Result<(), MainErrors> {
+// Wrapper around csv that swallows broken pipes (mainly so `| head -n 1` doesn't cause a panic)
+fn csv_swallow_broken_pipe<'a, I>(i: I) -> Result<(), MainErrors>
+where
+    I: Iterator<Item=&'a String>
+{
+     if let Err(e) = csv(i) {
+        if e.is_broken_pipe() {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn query(
+    con: &mut Connection,
+    query: &str,
+    drop_null_columns: bool,
+    drop_price_columns: bool,
+    omit_headers: bool,
+) -> Result<(), MainErrors> {
     let start = Instant::now();
 
     let mut prep = con.prepare(query)?;
@@ -958,7 +1157,10 @@ fn query(con: &mut Connection, query: &str, drop_null_columns: bool) -> Result<(
             let name = r.column_name(i)?;
             let v = r.get_raw_checked(i)?;
 
-            if (v.data_type() != SqlType::Null || !drop_null_columns) && !columns.contains(name) {
+            if (v.data_type() != SqlType::Null || !drop_null_columns)
+                && !columns.contains(name)
+                && (!drop_price_columns || !name.contains("Price"))
+            {
                 columns.insert(name.to_string());
             }
 
@@ -977,13 +1179,15 @@ fn query(con: &mut Connection, query: &str, drop_null_columns: bool) -> Result<(
         row_maps.push(row_map);
     }
 
-    csv(columns.iter());
+    if !omit_headers {
+        csv_swallow_broken_pipe(columns.iter())?;
+    }
     for r in row_maps.iter() {
         let mut values = Vec::new();
         for c in columns.iter() {
             values.push(r.get(c).unwrap());
         }
-        csv(values.into_iter());
+        csv_swallow_broken_pipe(values.into_iter())?;
     }
 
     info!("Query took {:?}", start.elapsed());
@@ -1053,6 +1257,14 @@ fn main() -> Result<(), MainErrors> {
             .arg(Arg::with_name("drop-null-columns")
                 .help("Doesn't print columns with all NULL values")
                 .long("drop-null-columns")
+                .takes_value(false))
+            .arg(Arg::with_name("drop-price-columns")
+                .help("Doesn't print columns with \"Price\" in their name")
+                .long("drop-price-columns")
+                .takes_value(false))
+            .arg(Arg::with_name("omit-headers")
+                .help("Don't print column headers, useful for piping single column results into xargs | wget and similar")
+                .long("omit-headers")
                 .takes_value(false))
             .arg(Arg::with_name("query")
                 .help("The sqlite SQL statement to execute")
@@ -1134,7 +1346,7 @@ fn main() -> Result<(), MainErrors> {
 
                 for p in contents.split_whitespace() {
                     part_numbers.push(p.to_string());
-                }                    
+                }
             }
             if let Some(parts_spreadsheet) = args.value_of("parts-spreadsheet") {
                 let path = Path::new(parts_spreadsheet);
@@ -1205,9 +1417,11 @@ fn main() -> Result<(), MainErrors> {
         "query" => {
             let args = args.unwrap();
             query(
-                &mut con, 
+                &mut con,
                 args.value_of("query").unwrap(),
                 args.is_present("drop-null-columns"),
+                args.is_present("drop-price-columns"),
+                args.is_present("omit-headers"),
             )?;
         },
         _ => (),

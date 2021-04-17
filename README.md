@@ -98,7 +98,7 @@ Get a list of LCSC categories to filter by
 
 Get a list of non empty columns for the given category without all the extra Price columns
 ```
-./lcsc-scrape query --drop-null-columns 'SELECT * FROM parts WHERE Category = "Power Management ICs/DC-DC Converters"' | head -n 1 | tr ',' '\n' | grep -v "Price"
+./lcsc-scrape query --drop-null-columns --drop-price-columns 'SELECT * FROM parts WHERE Category = "Power Management ICs/DC-DC Converters"' | head -n 1 | tr ',' '\n'
 ```
 
 
