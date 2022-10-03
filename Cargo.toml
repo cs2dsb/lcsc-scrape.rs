@@ -2,14 +2,14 @@
 name = "lcsc-scrape"
 version = "0.1.1"
 authors = ["cs2dsb <cs2dsb@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-reqwest = { version = "0.10.4", features = ["blocking"] }
+reqwest = { version = "0.11.12", features = ["blocking"] }
 clap = { version = "2.33.1" }
-scraper = "0.12.0"
+scraper = "0.13.0"
 regex = "1.3.7"
 lazy_static = "1.4.0"
 log = "0.4.8"
@@ -18,5 +18,5 @@ serde = { version = "1.0.110", features = ["derive"] }
 serde_json = "1.0.53"
 serde_urlencoded = "*"
 rusqlite = "0.23.1"
-calamine = "0.16.1"
+calamine = "0.18.0"
 linked_hash_set = "0.1.3"
